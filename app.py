@@ -5,6 +5,7 @@ import re
 import os
 import csv
 import io
+import base64
 import tempfile
 from pathlib import Path
 
@@ -19,7 +20,6 @@ st.set_page_config(
 # ===== GLOBAL CSS =====
 st.markdown("""
 <style>
-/* ---- ボタン共通 ---- */
 div[data-testid="stButton"] button {
     height: 72px;
     font-size: 20px;
@@ -29,8 +29,6 @@ div[data-testid="stButton"] button[kind="primary"] {
     font-size: 22px;
     font-weight: bold;
 }
-
-/* ---- ヘッダー ---- */
 .app-header {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     color: white;
@@ -41,8 +39,6 @@ div[data-testid="stButton"] button[kind="primary"] {
 }
 .app-header h2 { margin: 0 0 0.2rem 0; font-size: 1.6rem; }
 .app-header p  { margin: 0; font-size: 0.9rem; opacity: 0.85; }
-
-/* ---- タイマー ---- */
 .timer-wrap {
     background: #f7f8fc;
     border: 2px solid #e2e8f0;
@@ -59,8 +55,6 @@ div[data-testid="stButton"] button[kind="primary"] {
     color: #1a202c;
     line-height: 1;
 }
-
-/* ---- 人物バッジ ---- */
 .person-badge {
     background: #e8f4fd;
     border: 2px solid #4a90d9;
@@ -72,8 +66,6 @@ div[data-testid="stButton"] button[kind="primary"] {
     color: #2c5282;
     margin-bottom: 1rem;
 }
-
-/* ---- カットログ ---- */
 .cut-log {
     background: #f0fff4;
     border-left: 4px solid #48bb78;
@@ -86,9 +78,18 @@ div[data-testid="stButton"] button[kind="primary"] {
 </style>
 """, unsafe_allow_html=True)
 
-# ===== 永続化 =====
-SAVE_FILE = Path(__file__).parent / "meetup_session.json"
+# ===== 定数 =====
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+SAVE_FILE    = Path(__file__).parent / "meetup_session.json"
+MEDIA_TYPES  = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
 
+# ===== 永続化 =====
 def save_results(results: list) -> None:
     SAVE_FILE.write_text(json.dumps(results, ensure_ascii=False, indent=2))
 
@@ -107,15 +108,13 @@ for key, val in {
     "recording": False,
     "start_time": None,
     "timestamps": [],
+    "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
 # ===== CLAUDE ヘルパー =====
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-
 def call_with_retry(client, messages: list, max_tokens: int = 500, max_retries: int = 3):
-    """レートリミット対策：指数バックオフでリトライ"""
     for attempt in range(max_retries):
         try:
             return client.messages.create(
@@ -123,14 +122,13 @@ def call_with_retry(client, messages: list, max_tokens: int = 500, max_retries: 
                 max_tokens=max_tokens,
                 messages=messages,
             )
-        except Exception as e:
+        except Exception:
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # 1s → 2s → 4s
+                time.sleep(2 ** attempt)
             else:
                 raise
 
 def analyze_batch(client, transcripts: list) -> list:
-    """全員を 1 回の API 呼び出しで解析（コスト最適化）"""
     sections = "\n\n".join(
         f"=== 人物{i + 1} ===\n{t}" for i, t in enumerate(transcripts)
     )
@@ -147,17 +145,14 @@ def analyze_batch(client, transcripts: list) -> list:
         raise ValueError("JSON配列が見つかりません")
     return json.loads(match.group())
 
-def analyze_single(client, transcript: str, index: int) -> dict:
-    """個別解析（バッチ失敗時のフォールバック）"""
+def analyze_single(client, transcript: str) -> dict:
     resp = call_with_retry(client, [{
         "role": "user",
         "content": (
             "名刺交換会での会話の文字起こしです。\n"
             f"<会話>\n{transcript}\n</会話>\n\n"
             "以下をJSONのみで返してください:\n"
-            '- name: 相手の名前（「〇〇と申します」等から抽出。不明なら「不明」）\n'
-            '- summary: 会話内容の要約（2〜3文）\n'
-            '{"name": "...", "summary": "..."}'
+            '{"name": "名前または不明", "summary": "要約2〜3文"}'
         ),
     }])
     raw = resp.content[0].text.strip()
@@ -166,6 +161,36 @@ def analyze_single(client, transcript: str, index: int) -> dict:
         data = json.loads(match.group())
         return {"name": data.get("name", "不明"), "summary": data.get("summary", raw)}
     return {"name": "不明", "summary": raw}
+
+def ocr_business_card(client, image_bytes: bytes, media_type: str) -> dict:
+    """名刺画像を Claude Vision で OCR（API を呼びます）"""
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    resp = call_with_retry(client, [{
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": image_b64},
+            },
+            {
+                "type": "text",
+                "text": (
+                    "この名刺から以下をJSONのみで抽出してください:\n"
+                    '{"name": "氏名", "company": "会社名", "title": "役職", '
+                    '"email": "メールアドレス", "phone": "電話番号"}\n'
+                    "読み取れない項目はnullにしてください。"
+                ),
+            },
+        ],
+    }], max_tokens=300)
+    raw = resp.content[0].text.strip()
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
 def get_transcript(segs: list, t_start: float, t_end: float) -> str:
     return "".join(
@@ -180,7 +205,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ===== TABS =====
 tab1, tab2 = st.tabs(["📍 イベント中", "🏠 帰宅後"])
 
 # ============================================================
@@ -268,14 +292,16 @@ with tab2:
         type=["mp3", "mp4", "m4a", "wav", "ogg", "webm"],
     )
 
-    api_key = st.text_input(
+    api_key_input = st.text_input(
         "Claude API Key",
         type="password",
-        value=os.getenv("ANTHROPIC_API_KEY", ""),
+        value=st.session_state.api_key,
         placeholder="sk-ant-...",
     )
+    if api_key_input:
+        st.session_state.api_key = api_key_input.strip()
 
-    can_process = audio_file is not None and bool(api_key.strip())
+    can_process = audio_file is not None and bool(st.session_state.api_key)
 
     if st.button(
         "🚀 文字起こし・解析開始",
@@ -294,13 +320,11 @@ with tab2:
             from faster_whisper import WhisperModel
             from anthropic import Anthropic
 
-            # 1. Whisper モデル（初回のみロード）
             with st.spinner("🔄 Whisper モデル読み込み中（初回は少し時間がかかります）..."):
                 if "whisper" not in st.session_state:
                     st.session_state.whisper = WhisperModel("small", compute_type="int8")
                 model = st.session_state.whisper
 
-            # 2. 文字起こし（リアルタイム進捗）
             segs_gen, info = model.transcribe(temp_path, language="ja")
             duration = info.duration
             t_bar = st.progress(0.0, text="🎙️ 文字起こし中...")
@@ -314,7 +338,6 @@ with tab2:
                 )
             t_bar.progress(1.0, text="✅ 文字起こし完了")
 
-            # 3. 人物ごとの文字起こしを取得
             tss_full = tss + [duration]
             n_persons = len(tss_full) - 1
             transcripts = [
@@ -322,16 +345,13 @@ with tab2:
                 for i in range(n_persons)
             ]
 
-            # 4. Claude Haiku でバッチ解析（失敗時は個別にフォールバック）
-            client = Anthropic(api_key=api_key.strip())
+            client = Anthropic(api_key=st.session_state.api_key)
             bar = st.progress(0.0, text="🤖 Claude Haiku で解析中（一括処理）...")
             results = []
 
             non_empty_idx = [i for i, t in enumerate(transcripts) if t]
             try:
                 batch_data = analyze_batch(client, [transcripts[i] for i in non_empty_idx])
-                # id をキーにしてマッピング（Claude が id を返す場合）
-                # 返ってきた順番で対応
                 batch_map = {
                     non_empty_idx[j]: batch_data[j]
                     for j in range(min(len(non_empty_idx), len(batch_data)))
@@ -341,31 +361,31 @@ with tab2:
                     results.append({
                         "番号": i + 1,
                         "名前": d.get("name", "不明") if t else "（不明）",
+                        "会社名": "", "役職": "", "メール": "", "電話": "",
                         "会話要約": d.get("summary", "（解析失敗）") if t else "（音声なし）",
                         "文字起こし": t,
                     })
                 bar.progress(1.0, text="✅ 解析完了（一括処理）")
 
             except Exception:
-                # バッチ失敗 → 個別処理にフォールバック
                 bar.progress(0.0, text="⚠️ 個別処理に切り替えます...")
                 results = []
                 for i, t in enumerate(transcripts):
                     bar.progress((i + 0.5) / n_persons, text=f"解析中... {i+1}/{n_persons} 人目")
                     if not t:
-                        results.append({"番号": i+1, "名前": "（不明）", "会話要約": "（音声なし）", "文字起こし": ""})
+                        results.append({"番号": i+1, "名前": "（不明）", "会社名": "", "役職": "", "メール": "", "電話": "", "会話要約": "（音声なし）", "文字起こし": ""})
                         bar.progress((i + 1) / n_persons)
                         continue
                     try:
-                        d = analyze_single(client, t, i)
-                        results.append({"番号": i+1, "名前": d["name"], "会話要約": d["summary"], "文字起こし": t})
+                        d = analyze_single(client, t)
+                        results.append({"番号": i+1, "名前": d["name"], "会社名": "", "役職": "", "メール": "", "電話": "", "会話要約": d["summary"], "文字起こし": t})
                     except Exception:
-                        results.append({"番号": i+1, "名前": "不明", "会話要約": "（解析失敗）", "文字起こし": t})
+                        results.append({"番号": i+1, "名前": "不明", "会社名": "", "役職": "", "メール": "", "電話": "", "会話要約": "（解析失敗）", "文字起こし": t})
                     bar.progress((i + 1) / n_persons)
                 bar.progress(1.0, text="✅ 解析完了")
 
             st.session_state.results = results
-            save_results(results)  # ページリロード後も保持
+            save_results(results)
 
         except Exception as e:
             st.error(f"エラーが発生しました: {e}")
@@ -378,39 +398,93 @@ with tab2:
         n_results = len(st.session_state.results)
         st.subheader(f"📋 会話一覧（{n_results} 人）")
 
-        # 概要テーブル（文字起こし列は除外）
-        display_data = [
-            {"番号": r["番号"], "名前": r["名前"], "会話要約": r["会話要約"]}
-            for r in st.session_state.results
-        ]
+        # 概要テーブル
+        display_fields = ["番号", "名前", "会社名", "メール", "会話要約"]
+        display_data = [{k: r.get(k, "") for k in display_fields} for r in st.session_state.results]
         st.dataframe(
             display_data,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "番号": st.column_config.NumberColumn("No.", width="small"),
-                "名前": st.column_config.TextColumn("名前", width="medium"),
+                "番号":   st.column_config.NumberColumn("No.", width="small"),
+                "名前":   st.column_config.TextColumn("名前", width="medium"),
+                "会社名": st.column_config.TextColumn("会社名", width="medium"),
+                "メール": st.column_config.TextColumn("メール", width="medium"),
                 "会話要約": st.column_config.TextColumn("会話要約", width="large"),
             },
         )
 
-        # 詳細：タップで全文字起こしを展開
-        st.subheader("📝 詳細（タップで展開）")
-        for row in st.session_state.results:
-            label = f"{row['番号']}. {row['名前']}"
+        # 詳細 + 名刺 OCR
+        st.subheader("📝 詳細・名刺 OCR（タップで展開）")
+
+        for idx, row in enumerate(st.session_state.results):
+            has_card = bool(row.get("会社名") or row.get("メール"))
+            icon = "🪪" if has_card else "👤"
+            label = f"{icon} {row['番号']}. {row['名前']}"
+            if row.get("会社名"):
+                label += f"　　{row['会社名']}"
+
             with st.expander(label):
+                # 会話要約
                 st.write(row["会話要約"])
-                transcript = row.get("文字起こし", "")
-                if transcript:
+
+                # 名刺 OCR セクション
+                st.divider()
+                st.caption("📷 名刺（任意・スキップ可）")
+
+                if has_card:
+                    # OCR済みデータを表示
+                    cols = st.columns(2)
+                    for field, label_text in [("会社名", "会社"), ("役職", "役職"), ("メール", "メール"), ("電話", "電話")]:
+                        if row.get(field):
+                            st.write(f"**{label_text}:** {row[field]}")
+                    if st.button("🔄 名刺を撮り直す", key=f"redo_{idx}"):
+                        st.session_state.results[idx].update({"会社名": "", "役職": "", "メール": "", "電話": ""})
+                        save_results(st.session_state.results)
+                        st.rerun()
+                else:
+                    # 名刺アップロード
+                    card_img = st.file_uploader(
+                        "名刺写真をアップロード",
+                        type=["jpg", "jpeg", "png", "webp"],
+                        key=f"card_{idx}",
+                        label_visibility="collapsed",
+                    )
+                    if card_img:
+                        st.image(card_img, width=240)
+                        if st.button("🔍 OCR 実行", key=f"ocr_{idx}", type="primary"):
+                            if not st.session_state.api_key:
+                                st.error("API キーが必要です")
+                            else:
+                                with st.spinner("🪪 名刺を読み取り中..."):
+                                    from anthropic import Anthropic
+                                    client = Anthropic(api_key=st.session_state.api_key)
+                                    media_type = MEDIA_TYPES.get(
+                                        Path(card_img.name).suffix.lower(), "image/jpeg"
+                                    )
+                                    data = ocr_business_card(client, card_img.read(), media_type)
+                                st.session_state.results[idx].update({
+                                    "名前":   data.get("name")    or row["名前"],
+                                    "会社名": data.get("company") or "",
+                                    "役職":   data.get("title")   or "",
+                                    "メール": data.get("email")   or "",
+                                    "電話":   data.get("phone")   or "",
+                                })
+                                save_results(st.session_state.results)
+                                st.rerun()
+
+                # 全文字起こし
+                if row.get("文字起こし"):
                     st.divider()
                     st.caption("全文字起こし")
-                    st.text(transcript)
+                    st.text(row["文字起こし"])
 
         # CSV ダウンロード
+        csv_fields = ["番号", "名前", "会社名", "役職", "メール", "電話", "会話要約"]
         buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=["番号", "名前", "会話要約"])
+        writer = csv.DictWriter(buf, fieldnames=csv_fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(display_data)
+        writer.writerows(st.session_state.results)
         st.download_button(
             "📥 CSV ダウンロード",
             data=buf.getvalue().encode("utf-8-bom"),

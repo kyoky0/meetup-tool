@@ -12,3 +12,4 @@ venv/
 *.webm
 .DS_Store
 meetup_session.json
+.venv/
